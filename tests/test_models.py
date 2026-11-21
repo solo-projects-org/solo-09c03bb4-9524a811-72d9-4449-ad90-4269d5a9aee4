@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.models import BatchIn, CorrectionIn, ScanIn
+from app.models import BatchIn, CorrectionIn, JointSettlementIn, ScanIn
 
 
 def test_scan_accepts_carton_with_intact_seal():
@@ -72,3 +72,30 @@ def test_correction_rejects_duplicate_moves():
                 {"serial_no": "S", "carton_no": "C2"},
             ]
         )
+
+
+def test_joint_settlement_rejects_duplicate_batches_and_bad_result_ids():
+    with pytest.raises(ValueError):
+        JointSettlementIn(
+            batches=[
+                {"batch_id": "B", "result_id": 1},
+                {"batch_id": "B", "result_id": 2},
+            ]
+        )
+    with pytest.raises(ValueError):
+        JointSettlementIn(batches=[])
+    with pytest.raises(ValueError):
+        JointSettlementIn(batches=[{"batch_id": "B", "result_id": 0}])
+    with pytest.raises(ValueError):
+        JointSettlementIn(batches=[{"batch_id": "B", "result_id": 1, "extra": 1}])
+
+
+def test_joint_settlement_accepts_multiple_batches():
+    payload = JointSettlementIn(
+        batches=[
+            {"batch_id": "B-1", "result_id": 1},
+            {"batch_id": " B-2 ", "result_id": 7},
+        ]
+    )
+    assert [entry.batch_id for entry in payload.batches] == ["B-1", "B-2"]
+    assert [entry.result_id for entry in payload.batches] == [1, 7]

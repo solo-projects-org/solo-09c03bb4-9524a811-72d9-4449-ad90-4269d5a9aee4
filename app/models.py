@@ -344,6 +344,152 @@ class RefreshOut(BaseModel):
     result: VerificationResultOut
 
 
+# ---------------------------------------------------------------------------
+# Working paper and joint settlement
+# ---------------------------------------------------------------------------
+
+WorkingPaperMode = Literal["whole_batch", "received"]
+
+SettlementIssueCode = Literal[
+    "result_outdated",
+    "serial_reported_by_multiple_results",
+    "serial_retained_by_unsettled_draft",
+]
+
+
+class JointSettlementBatchIn(BaseModel):
+    """One batch offered for settlement together with its result number."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: ShortCode = Field(description="批次编号", examples=["BATCH-2026-001"])
+    result_id: int = Field(
+        ge=1,
+        description="该批本次交账所依据的核对结果编号；必须是提交时该批当前生效的结果",
+        examples=[3],
+    )
+
+
+class JointSettlementIn(BaseModel):
+    """Joint settlement submission: several batches in one atomic call."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "batches": [
+                        {"batch_id": "BATCH-2026-001", "result_id": 3},
+                        {"batch_id": "BATCH-2026-002", "result_id": 5},
+                    ]
+                }
+            ]
+        },
+    )
+
+    batches: list[JointSettlementBatchIn] = Field(
+        min_length=1,
+        max_length=1_000,
+        description="参与本次联合交账的批次及各自所用结果号；批次不能重复",
+    )
+
+    @model_validator(mode="after")
+    def check_unique_batches(self) -> JointSettlementIn:
+        ids = [entry.batch_id for entry in self.batches]
+        if len(set(ids)) != len(ids):
+            raise ValueError("同一批次在一次联合交账请求中重复出现")
+        return self
+
+
+class SettlementIssueOut(BaseModel):
+    code: SettlementIssueCode = Field(description="暂缓原因代码，便于程序化追查")
+    message: str = Field(description="中文说明，便于财务直接阅读")
+    serial_numbers: list[str] = Field(
+        default_factory=list, description="涉及的序列号（如与序列号相关）"
+    )
+    related_batch_ids: list[str] = Field(
+        default_factory=list, description="造成冲突或占用序列号的其他批次"
+    )
+
+
+class JointSettlementBatchOut(BaseModel):
+    batch_id: str
+    status: Literal["settled", "deferred"]
+    submitted_result_id: int
+    submitted_result_is_current: bool = Field(
+        description="提交的结果号是否等于提交时该批当前生效结果"
+    )
+    active_result_id: int | None = Field(description="提交时该批当前生效结果")
+    previous_mode: WorkingPaperMode = Field(description="提交前底稿形态")
+    previous_result_id: int | None = Field(description="提交前底稿所用结果号")
+    previous_item_count: int = Field(description="提交前底稿中的序列号件数")
+    working_paper_mode: WorkingPaperMode = Field(description="本次处理后的底稿形态")
+    working_paper_result_id: int | None = Field(description="本次处理后底稿所用结果号")
+    settled_item_count: int = Field(description="处理后底稿中的序列号件数")
+    released_serial_count: int = Field(
+        description="因本次入账而不再占用底稿的序列号数量"
+    )
+    issues: list[SettlementIssueOut] = Field(
+        default_factory=list, description="暂缓原因；已入账批次为空"
+    )
+
+
+class WorkingPaperItemOut(BaseModel):
+    batch_id: str
+    serial_no: str
+    carton_no: str
+    receiving_point: str | None = Field(
+        description="实收件所在收货点；整批底稿为空"
+    )
+    scan_ids: list[str] = Field(
+        default_factory=list, description="支撑该实收件的扫描编号；整批底稿为空"
+    )
+
+
+class WorkingPaperSerialConflictOut(BaseModel):
+    serial_no: str
+    batch_ids: list[str] = Field(description="底稿中同时占用该序列号的批次")
+
+
+class WorkingPaperBatchOut(BaseModel):
+    batch_id: str
+    mode: WorkingPaperMode = Field(
+        description="whole_batch=整批明细；received=按核对结果中的实收件"
+    )
+    result_id: int | None = Field(
+        description="该批底稿所用核对结果号；整批形态尚未使用结果号"
+    )
+    result_is_current: bool = Field(
+        description="所用结果号是否为该批当前生效结果；整批形态为 false"
+    )
+    active_result_id: int | None = Field(description="该批当前生效结果号")
+    item_count: int
+    updated_at: str
+    items: list[WorkingPaperItemOut]
+
+
+class WorkingPaperOut(BaseModel):
+    batch_count: int
+    item_count: int
+    occupied_serial_count: int
+    batches: list[WorkingPaperBatchOut]
+    serial_conflicts: list[WorkingPaperSerialConflictOut] = Field(
+        description=(
+            "被多个批次底稿同时占用的序列号；单批查询时只列出涉及该批的条目，"
+            "但占用方按全部批次计算"
+        )
+    )
+
+
+class JointSettlementOut(BaseModel):
+    settled_batch_ids: list[str]
+    deferred_batch_ids: list[str]
+    batches: list[JointSettlementBatchOut] = Field(
+        description="按提交顺序返回各批结论及暂缓原因"
+    )
+    working_paper: WorkingPaperOut = Field(description="本次提交后的底稿快照")
+
+
 class HealthOut(BaseModel):
     status: Literal["ok"]
     database: Literal["ok"]

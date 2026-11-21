@@ -20,6 +20,14 @@ Docker Compose 启动。
 | 新版一次性纳入已受理扫描：实收、冲突、无凭证、明细同一事务生效 | `correct_packing_list` 的激活事务 |
 | 变更失败继续按原装箱单供数 | 失败分支：原版本/原结果不被修改，并记录 `failed` 版本 |
 | 未知箱号 / 不在装箱单中的序列号 | 计为 `unmatched` 扫描，不产生假实收 |
+| 新登记批次在财务底稿中为**整批明细**，占用装箱单中的全部序列号，未使用结果号 | `working_paper_batches` / `working_paper_items` |
+| 联合交账通过后，底稿换成该批结果中的**实收件**，并记录所用结果号 | `POST /settlements`、`settle_jointly` |
+| 提交的结果号不是该批当前生效结果 → **仅该批**暂缓（`result_outdated`） | `settle_jointly` 第 2 步 |
+| 同一序列号被多份当前结果申报为实收 → 涉及批次全部暂缓 | 第 3 步，`serial_reported_by_multiple_results` |
+| 暂缓/未申报批次保留原底稿并继续占用其序列号；通过批次因此重号也暂缓，反复判定直至无连带冲突 | 第 4 步，`serial_retained_by_unsettled_draft` |
+| 能在同一次提交中一起腾出序列号的批次可以一并入账 | 占用按“通过批次的**入账后**实收件”计算 |
+| 通过批次的底稿在同一事务替换；写入失败整次回滚，全部保留原底稿（500） | `settle_jointly` 第 5 步 |
+| 底稿可查询整批/实收形态、各批所用结果号与实收扫描编号 | `GET /working-paper`、`GET /working-paper/{batch_id}` |
 
 补充约定：
 
@@ -29,6 +37,23 @@ Docker Compose 启动。
 - 服务重启时，中断的 `pending` 版本会标记为 `failed`，并把期间已受理的扫描补算进原
   生效版本，避免旧结果失真。
 - `RECALC_DELAY_SECONDS` 只用于演示重算窗口，生产可设为 0。
+
+### 财务底稿与联合交账
+
+底稿（`working_paper_*` 表）是财务实际入账的依据，与核对结果是两套数据：
+
+- 批次登记时底稿自动写入整批明细（`mode=whole_batch`），占用全部申报序列号。
+- 联合交账提交的是 `[{batch_id, result_id}]`；只有 `result_id` 等于提交时该批
+  `active_result_id` 的批次才可能入账，且以**提交瞬间**的结果快照为准，之后的新扫描
+  不会回溯改动已入账内容；需要用新结果重交才能更新底稿。
+- 暂缓/未申报批次不动底稿，其序列号继续被占用。通过批次按**入账后的实收件**占用序列号，
+  因此未实收的申报件在入账时即释放，可供其他批次同时入账。
+- 判定会反复进行：某批因重号暂缓后，它的原底稿继续占号，可能再牵连其他批次，
+  直到没有连带冲突为止。返回的 `issues[].related_batch_ids` 可直接追查占用方。
+- 重号规则看的是**所有批次当前生效结果**，不限于本次提交的批次。
+- 整个判定与替换在一个 `BEGIN IMMEDIATE` 事务内完成；任何写入失败都会回滚，响应 500，
+  所有批次保留原底稿。
+- 历史数据库启动时自动补写缺失的底稿（`ensure_working_papers`）。
 
 ## 启动（Docker Compose）
 
@@ -85,6 +110,11 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
    - 窗口内 `POST /scans` 照常 201，`result_refreshed=false`；
    - 新版本生效后，窗口内受理的扫描已包含在版本 2 的结果中。
 7. 历史结果与装箱单版本可分别查询。
+8. 联合交账连带暂缓：
+   - `DS-D` 未提交，底稿占用 `DS-X`；提交 `DS-A`（实收 `DS-X`）→ `DS-A` 暂缓；
+   - `DS-A` 原底稿继续占用 `DS-Z` → 同批提交的 `DS-C` 也暂缓（连带）；
+   - 再把占用序列号的 `DS-D` 一起提交 → 三批同时入账，`GET /working-paper`
+     显示各批形态、所用结果号、实收件与扫描编号，`serial_conflicts` 为空。
 
 ## API 一览
 
@@ -101,6 +131,9 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
 | GET | `/batches/{id}/results` | 历史结果列表 |
 | GET | `/batches/{id}/results/{result_id}` | 指定历史结果 |
 | POST | `/batches/{id}/result/refresh` | 手动重算生效版本 |
+| GET | `/working-paper` | 查询全部批次底稿（含重号清单） |
+| GET | `/working-paper/{id}` | 查询单批底稿（形态、结果号、实收件） |
+| POST | `/settlements` | 联合交账：多批原子入账/暂缓 |
 | GET | `/health` | 健康检查 |
 
 ## 并发与一致性
@@ -116,11 +149,11 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
 
 ```
 app/
-  main.py        应用工厂、异常映射、启动恢复
+  main.py        应用工厂、异常映射、启动恢复与底稿补写
   config.py      环境变量配置
   db.py          SQLite schema 与事务封装
   models.py      Pydantic 请求/响应模型
-  service.py     核对规则、版本切换、查询
+  service.py     核对规则、版本切换、底稿与联合交账
   api/routes.py  HTTP 路由
 scripts/demo.py  Swagger 演示脚本（标准库）
 tests/           pytest + FastAPI TestClient

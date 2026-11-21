@@ -146,6 +146,34 @@ CREATE TABLE IF NOT EXISTS result_scan_details (
     unmatched      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (result_id, seq)
 );
+
+-- The finance working paper (底稿).  A newly registered batch starts as a
+-- whole-batch entry occupying every declared serial.  A joint settlement
+-- replaces a passing batch's entry with the received items of the submitted
+-- result.  Deferred / unsubmitted batches keep their entry and therefore keep
+-- occupying its serial numbers.
+CREATE TABLE IF NOT EXISTS working_paper_batches (
+    batch_id    TEXT PRIMARY KEY REFERENCES batches(batch_id),
+    mode        TEXT NOT NULL CHECK (mode IN ('whole_batch', 'received')),
+    result_id   INTEGER REFERENCES verification_results(id),
+    updated_at  TEXT NOT NULL,
+    CHECK (
+        (mode = 'whole_batch' AND result_id IS NULL)
+        OR (mode = 'received' AND result_id IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS working_paper_items (
+    batch_id        TEXT NOT NULL REFERENCES working_paper_batches(batch_id),
+    serial_no       TEXT NOT NULL,
+    carton_no       TEXT NOT NULL,
+    receiving_point TEXT,
+    scan_ids_json   TEXT NOT NULL DEFAULT '[]',
+    position        INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, serial_no)
+);
+CREATE INDEX IF NOT EXISTS idx_working_paper_items_serial
+    ON working_paper_items(serial_no);
 """
 
 

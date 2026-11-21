@@ -14,6 +14,10 @@ Scenario 2: correct an item's carton.  While the new packing-list version is
             recalculating, scans keep being accepted and queries keep serving
             the previous version's result.  The new version then includes the
             scans accepted during the window in one atomic snapshot.
+Scenario 3: joint settlement of several batches.  Drafts that retain a serial
+            defer the batch claiming it, and the deferral cascades; settling
+            the occupying batches in the same submission releases the serials
+            and lets every batch book together.
 
 The script only uses the standard library so it also works inside the image.
 """
@@ -246,6 +250,91 @@ def main() -> int:
     )
     _, versions = call("GET", f"/batches/{BATCH}/packing-lists/versions", expect=200)
     print("装箱单版本:", json.dumps(versions, ensure_ascii=False, indent=2))
+
+    show("6. 联合交账：连带暂缓与一并入账")
+    # DS-D is never submitted, so its draft keeps occupying DS-X.
+    # DS-A receives DS-X -> deferred by DS-D's retained draft.
+    # DS-A's retained draft still occupies DS-Z -> DS-C is deferred too (cascade).
+    # Submitting all three releases DS-X and DS-Z, so they settle together.
+    # Serials are prefixed with the run's batch id so repeated demo runs do not
+    # collide with drafts left by earlier runs.
+    serial_x, serial_z, serial_c = (f"{BATCH}-DS-X", f"{BATCH}-DS-Z", f"{BATCH}-DS-C1")
+    for batch_id, serials in (
+        ("DS-D", [serial_x]),
+        ("DS-A", [serial_x, serial_z]),
+        ("DS-C", [serial_z, serial_c]),
+    ):
+        call(
+            "POST",
+            "/batches",
+            {
+                "batch_id": f"{BATCH}-{batch_id}",
+                "cartons": [{"carton_no": f"CTN-{batch_id}", "serials": serials}],
+            },
+            expect=201,
+        )
+    call(
+        "POST",
+        f"/batches/{BATCH}-DS-A/scans",
+        {"scan_id": "SC-DS-A-1", "receiving_point": "收货点D", "serial_no": serial_x},
+        expect=201,
+    )
+    call(
+        "POST",
+        f"/batches/{BATCH}-DS-C/scans",
+        {"scan_id": "SC-DS-C-1", "receiving_point": "收货点C", "serial_no": serial_z},
+        expect=201,
+    )
+
+    def result_id(batch_id: str) -> int:
+        _, batch = call("GET", f"/batches/{BATCH}-{batch_id}", expect=200)
+        return batch["active_result_id"]
+
+    show("6a. 只提交 DS-A 与 DS-C：连带暂缓")
+    _, deferred = call(
+        "POST",
+        "/settlements",
+        {
+            "batches": [
+                {"batch_id": f"{BATCH}-DS-A", "result_id": result_id("DS-A")},
+                {"batch_id": f"{BATCH}-DS-C", "result_id": result_id("DS-C")},
+            ]
+        },
+        expect=200,
+    )
+    print(
+        "已入账:",
+        deferred["settled_batch_ids"],
+        "| 暂缓:",
+        deferred["deferred_batch_ids"],
+    )
+    print(json.dumps(deferred["batches"], ensure_ascii=False, indent=2))
+
+    show("6b. 连同占用序列号的 DS-D 一并提交：一起入账")
+    _, settled = call(
+        "POST",
+        "/settlements",
+        {
+            "batches": [
+                {"batch_id": f"{BATCH}-DS-A", "result_id": result_id("DS-A")},
+                {"batch_id": f"{BATCH}-DS-C", "result_id": result_id("DS-C")},
+                {"batch_id": f"{BATCH}-DS-D", "result_id": result_id("DS-D")},
+            ]
+        },
+        expect=200,
+    )
+    print(
+        "已入账:",
+        settled["settled_batch_ids"],
+        "| 暂缓:",
+        settled["deferred_batch_ids"],
+    )
+    print(json.dumps(settled["working_paper"], ensure_ascii=False, indent=2))
+
+    show("6c. 底稿查询：实收件及各批所用结果号")
+    _, working_paper = call("GET", "/working-paper", expect=200)
+    print(json.dumps(working_paper, ensure_ascii=False, indent=2))
+    print("重号（应为空）:", working_paper["serial_conflicts"])
 
     print(f"\nSwagger: {BASE}/docs  |  批次: {BATCH}")
     return 0

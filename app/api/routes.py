@@ -219,3 +219,56 @@ def refresh_result(batch_id: str, db=Depends(get_db)):
         "batch_id": batch_id,
         "result": service.get_result(db, batch_id, result_id),
     }
+
+
+@router.get(
+    "/working-paper",
+    response_model=models.WorkingPaperOut,
+    tags=["财务底稿"],
+    summary="查询财务底稿（全部批次）",
+    description=(
+        "底稿有两种形态：`whole_batch` 为整批明细，占用该批装箱单中的全部序列号，"
+        "尚未使用结果号；`received` 为联合交账通过后的实收件，记录所用结果号，"
+        "并逐件列出收货点与扫描编号。`serial_conflicts` 列出被多个批次同时占用的"
+        "序列号（正常流程下应为空，可用于追查重号）。"
+    ),
+)
+def get_working_paper(db=Depends(get_db)):
+    return service.get_working_paper(db)
+
+
+@router.get(
+    "/working-paper/{batch_id}",
+    response_model=models.WorkingPaperOut,
+    tags=["财务底稿"],
+    summary="查询单个批次的底稿",
+)
+def get_batch_working_paper(batch_id: str, db=Depends(get_db)):
+    return service.get_working_paper(db, batch_id)
+
+
+@router.post(
+    "/settlements",
+    response_model=models.JointSettlementOut,
+    tags=["财务底稿"],
+    summary="联合交账（多批原子入账）",
+    description=(
+        "提交一组批次及各自使用的核对结果号，用通过批次的实收件替换底稿中的整批明细。\n\n"
+        "判定规则（按提交时的当前结果与底稿）：\n"
+        "1. 结果号不是该批当前生效结果的批次暂缓（`result_outdated`），其余批次照常处理。\n"
+        "2. 同一序列号被多份当前结果申报为实收时，涉及的批次全部暂缓"
+        "（`serial_reported_by_multiple_results`）。\n"
+        "3. 暂缓或未申报的批次保留原底稿，仍占用其中的序列号；通过批次若因此重号也暂缓"
+        "（`serial_retained_by_unsettled_draft`），并反复判定直到没有连带冲突。\n"
+        "4. 能在同一次提交中一起腾出序列号的批次可以一并入账。\n\n"
+        "所有通过批次的底稿在同一事务内替换；写入失败则整次提交回滚，"
+        "所有批次保留原底稿（响应 500）。返回各批结论与暂缓原因，供财务追查。"
+    ),
+)
+def settle_jointly(
+    payload: models.JointSettlementIn,
+    db=Depends(get_db),
+):
+    return service.settle_jointly(
+        db, [entry.model_dump() for entry in payload.batches]
+    )

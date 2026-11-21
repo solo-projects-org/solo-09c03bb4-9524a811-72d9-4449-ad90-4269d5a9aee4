@@ -423,6 +423,549 @@ def _scans_snapshot(conn: sqlite3.Connection, batch_id: str) -> tuple[list[sqlit
     return list(rows), int(watermark)
 
 
+# ---------------------------------------------------------------------------
+# Working paper (底稿)
+# ---------------------------------------------------------------------------
+
+
+def _working_paper_row(
+    conn: sqlite3.Connection, batch_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM working_paper_batches WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+
+
+def _working_paper_items(
+    conn: sqlite3.Connection, batch_id: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM working_paper_items
+         WHERE batch_id = ? ORDER BY position
+        """,
+        (batch_id,),
+    ).fetchall()
+
+
+def _insert_whole_batch_paper(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    packing: PackingList,
+    timestamp: str,
+) -> None:
+    """Seed a batch's working paper with its full declared packing list.
+
+    The whole-batch draft occupies every declared serial number, so any other
+    batch that later tries to book one of those serials is deferred until this
+    batch settles (or is itself settled together, releasing the serial).
+    """
+    conn.execute(
+        """
+        INSERT INTO working_paper_batches (batch_id, mode, result_id, updated_at)
+        VALUES (?, 'whole_batch', NULL, ?)
+        """,
+        (batch_id, timestamp),
+    )
+    conn.executemany(
+        """
+        INSERT INTO working_paper_items (
+            batch_id, serial_no, carton_no, receiving_point,
+            scan_ids_json, position
+        ) VALUES (?, ?, ?, NULL, '[]', ?)
+        """,
+        [
+            (batch_id, serial, packing.items[serial][0], position)
+            for position, serial in enumerate(packing.ordered_items)
+        ],
+    )
+
+
+def ensure_working_papers(db: Database) -> None:
+    """Backfill the working paper for batches registered before this feature.
+
+    Batches whose draft is already present are left untouched; a draft only
+    changes through joint settlement.
+    """
+    with db.immediate() as conn:
+        missing = conn.execute(
+            """
+            SELECT b.batch_id, v.id AS version_id
+              FROM batches b
+              JOIN packing_list_versions v
+                ON v.batch_id = b.batch_id AND v.status = 'active'
+             WHERE NOT EXISTS (
+                       SELECT 1 FROM working_paper_batches w
+                        WHERE w.batch_id = b.batch_id
+                   )
+            """
+        ).fetchall()
+        for row in missing:
+            packing = load_packing_list(conn, row["version_id"])
+            _insert_whole_batch_paper(
+                conn, row["batch_id"], packing, now_utc()
+            )
+
+
+def _received_items_for_result(
+    conn: sqlite3.Connection, result_id: int
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT serial_no, carton_no, receiving_point, scan_ids_json
+          FROM result_received WHERE result_id = ? ORDER BY position
+        """,
+        (result_id,),
+    ).fetchall()
+    return [
+        {
+            "serial_no": row["serial_no"],
+            "carton_no": row["carton_no"],
+            "receiving_point": row["receiving_point"],
+            "scan_ids": json.loads(row["scan_ids_json"]),
+        }
+        for row in rows
+    ]
+
+
+def _working_paper_snapshot(
+    conn: sqlite3.Connection, batch_id: str | None = None
+) -> dict[str, Any]:
+    """Build a working-paper view.
+
+    ``serial_conflicts`` is always computed across *all* batches, even for a
+    single-batch view, so a duplicate caused by another draft is visible when
+    investigating one batch.  ``item_count`` / ``occupied_serial_count`` and
+    ``serial_conflicts`` still describe only the selected scope.
+    """
+    params: tuple[Any, ...] = () if batch_id is None else (batch_id,)
+    where = "" if batch_id is None else "WHERE w.batch_id = ?"
+    rows = conn.execute(
+        f"""
+        SELECT w.batch_id, w.mode, w.result_id, w.updated_at,
+               b.active_result_id
+          FROM working_paper_batches w
+          JOIN batches b ON b.batch_id = w.batch_id
+          {where}
+         ORDER BY w.batch_id
+        """,
+        params,
+    ).fetchall()
+
+    # Global occupancy, independent of the requested scope.
+    global_owners: dict[str, list[str]] = {}
+    for item in conn.execute(
+        "SELECT batch_id, serial_no FROM working_paper_items"
+    ).fetchall():
+        global_owners.setdefault(item["serial_no"], []).append(item["batch_id"])
+
+    batches: list[dict[str, Any]] = []
+    owners: dict[str, list[str]] = {}
+    total_items = 0
+    for row in rows:
+        items = _working_paper_items(conn, row["batch_id"])
+        total_items += len(items)
+        for item in items:
+            owners.setdefault(item["serial_no"], []).append(row["batch_id"])
+        batches.append(
+            {
+                "batch_id": row["batch_id"],
+                "mode": row["mode"],
+                "result_id": row["result_id"],
+                "result_is_current": (
+                    row["mode"] == "received"
+                    and row["result_id"] == row["active_result_id"]
+                ),
+                "active_result_id": row["active_result_id"],
+                "item_count": len(items),
+                "updated_at": row["updated_at"],
+                "items": [
+                    {
+                        "batch_id": row["batch_id"],
+                        "serial_no": item["serial_no"],
+                        "carton_no": item["carton_no"],
+                        "receiving_point": item["receiving_point"],
+                        "scan_ids": json.loads(item["scan_ids_json"]),
+                    }
+                    for item in items
+                ],
+            }
+        )
+
+    if batch_id is None:
+        conflicts = [
+            {"serial_no": serial, "batch_ids": sorted(batch_ids)}
+            for serial, batch_ids in sorted(global_owners.items())
+            if len(batch_ids) > 1
+        ]
+    else:
+        conflicts = [
+            {"serial_no": serial, "batch_ids": sorted(batch_ids)}
+            for serial, batch_ids in sorted(global_owners.items())
+            if len(batch_ids) > 1 and batch_id in batch_ids
+        ]
+
+    return {
+        "batch_count": len(batches),
+        "item_count": total_items,
+        "occupied_serial_count": len(owners),
+        "batches": batches,
+        "serial_conflicts": conflicts,
+    }
+
+
+def _replace_working_paper(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    result_id: int,
+    received: Sequence[dict[str, Any]],
+    timestamp: str,
+) -> None:
+    """Replace one batch's whole-batch draft with its received items.
+
+    Runs inside the settlement transaction so a failure rolls every batch of
+    the submission back.
+    """
+    conn.execute("DELETE FROM working_paper_items WHERE batch_id = ?", (batch_id,))
+    conn.executemany(
+        """
+        INSERT INTO working_paper_items (
+            batch_id, serial_no, carton_no, receiving_point,
+            scan_ids_json, position
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                batch_id,
+                item["serial_no"],
+                item["carton_no"],
+                item["receiving_point"],
+                json.dumps(item["scan_ids"], ensure_ascii=False),
+                position,
+            )
+            for position, item in enumerate(received)
+        ],
+    )
+    conn.execute(
+        """
+        UPDATE working_paper_batches
+           SET mode = 'received', result_id = ?, updated_at = ?
+         WHERE batch_id = ?
+        """,
+        (result_id, timestamp, batch_id),
+    )
+
+
+def get_working_paper(db: Database, batch_id: str | None = None) -> dict[str, Any]:
+    with db.read() as conn:
+        if batch_id is not None:
+            _batch_row(conn, batch_id)
+            if _working_paper_row(conn, batch_id) is None:
+                raise NotFoundError(f"批次 {batch_id} 尚无底稿")
+        return _working_paper_snapshot(conn, batch_id)
+
+
+def _issue(
+    code: str,
+    message: str,
+    serial_numbers: Sequence[str] = (),
+    related_batch_ids: Sequence[str] = (),
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "message": message,
+        "serial_numbers": list(serial_numbers),
+        "related_batch_ids": list(related_batch_ids),
+    }
+
+
+def settle_jointly(db: Database, entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Settle several batches against their current results in one transaction.
+
+    Rules (evaluated against the current results and working papers as of the
+    submission snapshot):
+
+    * A submitted result that is not the batch's current result defers only
+      that batch (``result_outdated``).
+    * A serial number claimed as received by more than one submitted current
+      result defers every batch involved
+      (``serial_reported_by_multiple_results``).
+    * Deferred and unsubmitted batches keep their original draft and therefore
+      keep occupying its serial numbers.  A passing batch whose received items
+      would duplicate one of those serials is deferred too
+      (``serial_retained_by_unsettled_draft``), and the check repeats until no
+      cascading duplicate remains.
+    * Batches that release serials in the same submission can settle together,
+      because only the post-settlement claim of each passing batch counts.
+    * All passing batches' drafts are replaced atomically.  A write failure
+      rolls the whole submission back, leaving every draft untouched.
+    """
+    try:
+        with db.immediate() as conn:
+            timestamp = now_utc()
+
+            # -- 1. Load the submission against the snapshot ----------------
+            prepared: list[dict[str, Any]] = []
+            for entry in entries:
+                batch_id = entry["batch_id"]
+                submitted_result_id = int(entry["result_id"])
+                batch = _batch_row(conn, batch_id)
+
+                known_result = conn.execute(
+                    """
+                    SELECT id FROM verification_results
+                     WHERE id = ? AND batch_id = ?
+                    """,
+                    (submitted_result_id, batch_id),
+                ).fetchone()
+                if known_result is None:
+                    raise NotFoundError(
+                        f"批次 {batch_id} 的核对结果 {submitted_result_id} 不存在"
+                    )
+
+                paper = _working_paper_row(conn, batch_id)
+                paper_items = (
+                    _working_paper_items(conn, batch_id) if paper is not None else []
+                )
+                active_result_id = batch["active_result_id"]
+                is_current = (
+                    active_result_id is not None
+                    and int(active_result_id) == submitted_result_id
+                )
+                received = (
+                    _received_items_for_result(conn, submitted_result_id)
+                    if is_current
+                    else []
+                )
+                prepared.append(
+                    {
+                        "batch_id": batch_id,
+                        "submitted_result_id": submitted_result_id,
+                        "active_result_id": (
+                            None if active_result_id is None else int(active_result_id)
+                        ),
+                        "is_current": is_current,
+                        "received": received,
+                        "previous_mode": paper["mode"] if paper else "whole_batch",
+                        "previous_result_id": paper["result_id"] if paper else None,
+                        "previous_items": [
+                            {
+                                "serial_no": item["serial_no"],
+                                "carton_no": item["carton_no"],
+                                "receiving_point": item["receiving_point"],
+                                "scan_ids": json.loads(item["scan_ids_json"]),
+                            }
+                            for item in paper_items
+                        ],
+                        "issues": [],
+                        "settled": False,
+                    }
+                )
+
+            by_batch = {item["batch_id"]: item for item in prepared}
+
+            # -- 2. Outdated result numbers are deferred on their own -------
+            for item in prepared:
+                if not item["is_current"]:
+                    item["issues"].append(
+                        _issue(
+                            "result_outdated",
+                            (
+                                f"提交的结果号 {item['submitted_result_id']} 不是该批当前生效结果"
+                                f"（当前为 {item['active_result_id']}），保留原底稿"
+                            ),
+                        )
+                    )
+
+            # -- 3. Same serial claimed as received by several current results
+            # Every batch contributes its *current* (active) result, not only
+            # the submitted ones: an unsubmitted batch whose current result also
+            # reports the serial is equally a duplicate claim.  Only submitted
+            # batches can be deferred, but they are deferred whenever *any*
+            # other current result claims the same serial.
+            claims: dict[str, set[str]] = {}
+            for row in conn.execute(
+                """
+                SELECT r.batch_id, rr.serial_no
+                  FROM result_received rr
+                  JOIN verification_results r ON r.id = rr.result_id
+                  JOIN batches b
+                    ON b.batch_id = r.batch_id
+                   AND b.active_result_id = r.id
+                """
+            ).fetchall():
+                claims.setdefault(row["serial_no"], set()).add(row["batch_id"])
+
+            contenders = {
+                batch_id for batch_id, item in by_batch.items() if item["is_current"]
+            }
+            for item in prepared:
+                if not item["is_current"]:
+                    continue
+                batch_id = item["batch_id"]
+                duplicate_serials = sorted(
+                    received["serial_no"]
+                    for received in item["received"]
+                    if len(claims.get(received["serial_no"], set())) > 1
+                )
+                if not duplicate_serials:
+                    continue
+                related: set[str] = set()
+                for serial in duplicate_serials:
+                    related |= claims[serial] - {batch_id}
+                item["issues"].append(
+                    _issue(
+                        "serial_reported_by_multiple_results",
+                        (
+                            "以下序列号被多份当前结果同时申报为实收："
+                            f"{', '.join(duplicate_serials)}"
+                            f"（涉及批次 {', '.join(sorted(related))}），本批暂缓"
+                        ),
+                        serial_numbers=duplicate_serials,
+                        related_batch_ids=sorted(related),
+                    )
+                )
+                contenders.discard(batch_id)
+
+            # -- 4. Cascading duplicates against drafts that keep occupying --
+            # Occupancy: a passing batch counts only with its post-settlement
+            # received items (so it releases the rest immediately); every other
+            # batch counts with the serials of its current, unchanged draft.
+            old_serials: dict[str, set[str]] = {}
+            for batch_row in conn.execute(
+                "SELECT batch_id FROM working_paper_batches"
+            ).fetchall():
+                old_serials[batch_row["batch_id"]] = {
+                    item["serial_no"]
+                    for item in _working_paper_items(conn, batch_row["batch_id"])
+                }
+
+            while True:
+                owners: dict[str, set[str]] = {}
+                for batch_id, serials in old_serials.items():
+                    if batch_id in contenders:
+                        claimed = {
+                            received["serial_no"]
+                            for received in by_batch[batch_id]["received"]
+                        }
+                    else:
+                        claimed = serials
+                    for serial in claimed:
+                        owners.setdefault(serial, set()).add(batch_id)
+
+                newly_deferred: dict[str, list[dict[str, Any]]] = {}
+                for serial, batch_ids in sorted(owners.items()):
+                    if len(batch_ids) < 2:
+                        continue
+                    involved = sorted(batch_ids & contenders)
+                    if not involved:
+                        continue
+                    for batch_id in involved:
+                        newly_deferred.setdefault(batch_id, []).append(
+                            _issue(
+                                "serial_retained_by_unsettled_draft",
+                                (
+                                    f"序列号 {serial} 仍被暂缓或未申报批次的底稿占用"
+                                    f"（批次 {', '.join(sorted(batch_ids - {batch_id}))}），"
+                                    "本批暂缓以免重号"
+                                ),
+                                serial_numbers=[serial],
+                                related_batch_ids=sorted(
+                                    batch_ids - {batch_id}
+                                ),
+                            )
+                        )
+
+                if not newly_deferred:
+                    break
+                for batch_id, issues in newly_deferred.items():
+                    by_batch[batch_id]["issues"].extend(issues)
+                    contenders.discard(batch_id)
+
+            for batch_id in contenders:
+                by_batch[batch_id]["settled"] = True
+
+            # -- 5. Replace the draft of every passing batch atomically -----
+            for item in prepared:
+                if not item["settled"]:
+                    continue
+                batch_id = item["batch_id"]
+                previous = conn.execute(
+                    "SELECT * FROM working_paper_batches WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if previous is None:
+                    raise ConflictError(f"批次 {batch_id} 尚无底稿")
+                if previous["mode"] != item["previous_mode"] or (
+                    previous["result_id"] != item["previous_result_id"]
+                ):
+                    raise ConflictError(
+                        f"批次 {batch_id} 的底稿在本次提交期间发生变化，请重试"
+                    )
+                _replace_working_paper(
+                    conn,
+                    batch_id,
+                    item["submitted_result_id"],
+                    item["received"],
+                    timestamp,
+                )
+
+            outcomes: list[dict[str, Any]] = []
+            for item in prepared:
+                previous_serials = {
+                    previous["serial_no"] for previous in item["previous_items"]
+                }
+                if item["settled"]:
+                    final_serials = {
+                        received["serial_no"] for received in item["received"]
+                    }
+                    mode = "received"
+                    used_result_id = item["submitted_result_id"]
+                else:
+                    final_serials = previous_serials
+                    mode = item["previous_mode"]
+                    used_result_id = item["previous_result_id"]
+                outcomes.append(
+                    {
+                        "batch_id": item["batch_id"],
+                        "status": "settled" if item["settled"] else "deferred",
+                        "submitted_result_id": item["submitted_result_id"],
+                        "submitted_result_is_current": item["is_current"],
+                        "active_result_id": item["active_result_id"],
+                        "previous_mode": item["previous_mode"],
+                        "previous_result_id": item["previous_result_id"],
+                        "previous_item_count": len(item["previous_items"]),
+                        "working_paper_mode": mode,
+                        "working_paper_result_id": used_result_id,
+                        "settled_item_count": len(final_serials),
+                        "released_serial_count": len(previous_serials - final_serials),
+                        "issues": item["issues"],
+                    }
+                )
+
+            working_paper = _working_paper_snapshot(conn)
+    except ServiceError:
+        raise
+    except Exception as exc:
+        logger.exception("joint settlement failed; drafts were left untouched")
+        raise InternalError(
+            "联合交账失败，所有批次保留原底稿"
+        ) from exc
+
+    settled = [
+        outcome["batch_id"] for outcome in outcomes if outcome["status"] == "settled"
+    ]
+    deferred = [
+        outcome["batch_id"] for outcome in outcomes if outcome["status"] == "deferred"
+    ]
+    return {
+        "settled_batch_ids": settled,
+        "deferred_batch_ids": deferred,
+        "batches": outcomes,
+        "working_paper": working_paper,
+    }
+
+
 def refresh_result_locked(
     conn: sqlite3.Connection, batch_id: str, version_row: sqlite3.Row
 ) -> int:
@@ -525,6 +1068,9 @@ def create_batch(db: Database, payload: dict[str, Any]) -> int:
             "SELECT * FROM packing_list_versions WHERE id = ?", (version_id,)
         ).fetchone()
         result_id = refresh_result_locked(conn, batch_id, version_row)
+        _insert_whole_batch_paper(
+            conn, batch_id, load_packing_list(conn, version_id), timestamp
+        )
     return result_id
 
 

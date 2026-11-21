@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from .api.routes import router
 from .config import Settings
 from .db import Database
-from .service import ServiceError, recover_on_startup
+from .service import ServiceError, ensure_working_papers, recover_on_startup
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -21,6 +21,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database = Database(settings.db_path)
         database.init()
         recover_on_startup(database)
+        ensure_working_papers(database)
         app.state.db = database
         app.state.settings = settings
         yield
@@ -38,7 +39,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "4. `POST /batches/{batch_id}/packing-lists/corrections` 更正单件所属的箱，"
             "以新版本重算；重算期间查询仍返回原版本结果。\n"
             "5. `GET /batches/{batch_id}/result` 查询已保存的核对结果（实收、冲突、"
-            "无凭证、扫描明细）。"
+            "无凭证、扫描明细）。\n"
+            "6. `POST /settlements` 联合交账：一次提交多个批次及各自结果号，"
+            "用通过批次的实收件替换底稿；暂缓批次保留原底稿并继续占用序列号，"
+            "被牵连的批次也会暂缓（连带暂缓）。\n"
+            "7. `GET /working-paper` 查询底稿：各批形态、所用结果号、实收件与扫描编号。"
         ),
         lifespan=lifespan,
         docs_url="/docs",
